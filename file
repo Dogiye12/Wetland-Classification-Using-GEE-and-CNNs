@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+# Wetland-Classification-Using-GEE-and-CNNs (Synthetic)
+# -----------------------------------------------------
+# Creates synthetic satellite-like patches with GEE-style bands (RED, GREEN, NIR, SWIR),
+# derives indices (NDVI, NDWI), trains a small CNN for 3 classes:
+#   0 = Open Water, 1 = Wetland, 2 = Upland
+#
+# Usage:
+#   python wetland_gee_cnn_synth.py --n 1200 --size 32 --epochs 10 --batch 64 --out outputs
+#
+# Dependencies:
+#   numpy, pandas, matplotlib, torch, scikit-learn
+#
+# Outputs (in --out):
+#   - model.pt
+#   - metrics.txt  (acc, per-class metrics, confusion matrix)
+#   - preview.png  (grid of sample RGBs with GT/PRED)
+#   - dataset_meta.csv  (per-sample summary stats and label)
+#   - samples_pred.txt  (GT vs Pred for a subset)
+
+import os, math, argparse, random
+from typing import Tuple, List
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+
+# --------------------------
+# Utils & reproducibility
+# --------------------------
+SPECIAL_SEED = 42
+def set_seed(seed: int = SPECIAL_SEED):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def smooth2d(a: np.ndarray, k: int = 5) -> np.ndarray:
+    assert k % 2 == 1
+    pad = k // 2
+    ap = np.pad(a, ((pad, pad), (pad, pad)), mode="reflect")
+    out = np.zeros_like(a)
+    for i in range(a.shape[0]):
+        for j in range(a.shape[1]):
+            out[i, j] = ap[i:i+k, j:j+k].mean()
+    return out
+
+# --------------------------
+# Synthetic patch generator
+# --------------------------
+# Classes: 0 water, 1 wetland, 2 upland
+def _rand_field(ps: int, rng: np.random.Generator, scale=1.0) -> np.ndarray:
+    base = rng.normal(size=(ps, ps))
+    base = smooth2d(base, k=7)
+    base = (base - base.min()) / (base.max() - base.min() + 1e-9)
+    return np.clip(scale * base, 0, 1)
+
+def make_patch(ps: int, label: int, rng: np.random.Generator) -> Tuple[np.ndarray, int]:
+    """
+    Returns:
+      X: (C=6, H, W) channels = [RED, GREEN, BLUE, NIR, SWIR, NDVI/NDWI mixed or NDVI]
+      y: int label (0 water, 1 wetland, 2 upland)
+    """
+    # Base latent fields
+    veg = _rand_field(ps, rng, scale=1.0)                      # vegetation fraction
+    moisture = _rand_field(ps, rng, scale=1.0)                 # moisture/water presence
+    urban = np.clip(_rand_field(ps, rng, scale=1.0) - 0.6, 0, 1)  # small share of urban
+
+    # Class-driven adjustments
+    if label == 0:  # open water: high moisture, very low vegetation
+        moisture = np.clip(0.7 + 0.3 * moisture, 0, 1)
+        veg = np.clip(0.05 * veg, 0, 0.2)
+        urban *= 0.1
+    elif label == 1:  # wetland: high moisture, moderate vegetation
+        moisture = np.clip(0.5 + 0.5 * moisture, 0, 1)
+        veg = np.clip(0.4 + 0.4 * veg, 0, 1)
+        urban *= 0.2
+    else:  # upland: low moisture, variable vegetation, some urban/soil
+        moisture = np.clip(0.1 + 0.2 * moisture, 0, 0.5)
+        veg = np.clip(0.2 + 0.6 * veg, 0, 1)
+        urban = np.clip(urban + 0.2 * rng.random(), 0, 1)
+
+    # Spectral bands (0..1); "GEE-like" simplified physics
+    # - Water increases GREEN a bit, depresses NIR & SWIR; vegetation increases NIR, decreases RED
+    # - Urban/soil raises RED and SWIR
+    noise = lambda s: rng.normal(0, s, size=(ps, ps))
+    RED   = np.clip(0.25 + 0.20*urban - 0.20*veg + 0.05*noise(1.0), 0, 1)
+    GREEN = np.clip(0.30 + 0.10*moisture + 0.20*veg - 0.05*urban + 0.05*noise(1.0), 0, 1)
+    NIR   = np.clip(0.35 + 0.50*veg - 0.30*moisture - 0.05*urban + 0.05*noise(1.0), 0, 1)
+    SWIR  = np.clip(0.30 + 0.35*urban - 0.35*moisture - 0.10*veg + 0.05*noise(1.0), 0, 1)
+    BLUE  = np.clip(0.20 + 0.10*moisture + 0.05*noise(1.0), 0, 1)
+
+    # Indices
+    eps = 1e-6
+    NDVI = (NIR - RED) / (NIR + RED + eps)
+    NDWI = (GREEN - NIR) / (GREEN + NIR + eps)  # McFeeters-like
+
+    # Stack channels for CNN (use indices as extra signal)
+    X = np.stack([RED, GREEN, BLUE, NIR, SWIR, NDVI], axis=0).astype(np.float32)
+
+    return X, label
+
+def build_dataset(n: int, ps: int, seed: int = SPECIAL_SEED) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    # Balance classes as evenly as possible
+    per = n // 3
+    labels = [0]*per + [1]*per + [2]*(n - 2*per)
+    rng.shuffle(labels)
+    data = []
+    for y in labels:
+        patch, _ = make_patch(ps, y, rng)
+        data.append(patch)
+    X = np.stack(data, axis=0).astype(np.float32)
+    y = np.array(labels, dtype=np.int64)
+    return X, y
+
+# --------------------------
+# Torch dataset & model
+# --------------------------
+class WetlandDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.from_numpy(X)
+        self.y = torch.from_numpy(y)
+    def __len__(self): return len(self.y)
+    def __getitem__(self, i): return self.X[i], self.y[i]
+
+class SmallCNN(nn.Module):
+    def __init__(self, in_ch=6, n_classes=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(True), nn.MaxPool2d(2),  # /2
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(True), nn.MaxPool2d(2),     # /4
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.AdaptiveAvgPool2d(1)
+        )
+        self.fc = nn.Linear(128, n_classes)
+    def forward(self, x):
+        x = self.net(x).flatten(1)
+        return self.fc(x)
+
+# --------------------------
+# Training / evaluation
+# --------------------------
+def train_epoch(model, loader, opt, device):
+    model.train()
+    crit = nn.CrossEntropyLoss()
+    total_loss, total_n = 0.0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        opt.zero_grad()
+        logits = model(xb)
+        loss = crit(logits, yb)
+        loss.backward(); opt.step()
+        total_loss += loss.item() * yb.size(0)
+        total_n += yb.size(0)
+    return total_loss / total_n
+
+@torch.no_grad()
+def eval_epoch(model, loader, device):
+    model.eval()
+    all_y, all_p = [], []
+    crit = nn.CrossEntropyLoss()
+    total_loss, total_n = 0.0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        logits = model(xb)
+        loss = crit(logits, yb)
+        total_loss += loss.item() * yb.size(0)
+        total_n += yb.size(0)
+        preds = logits.argmax(1).cpu().numpy()
+        all_p.append(preds)
+        all_y.append(yb.cpu().numpy())
+    y_true = np.concatenate(all_y)
+    y_pred = np.concatenate(all_p)
+    acc = accuracy_score(y_true, y_pred)
+    return total_loss / total_n, acc, y_true, y_pred
+
+def save_preview(X, y_true, y_pred, path, n=12):
+    n = min(n, len(y_true))
+    idx = np.random.choice(len(y_true), n, replace=False)
+    cols, rows = 4, int(math.ceil(n/4))
+    plt.figure(figsize=(4*cols, 3*rows))
+    for k, i in enumerate(idx):
+        ax = plt.subplot(rows, cols, k+1)
+        # Show RGB (R,G,B from channels 0,1,2)
+        rgb = np.stack([X[i,0], X[i,1], X[i,2]], axis=-1)
+        rgb = np.clip(rgb, 0, 1)
+        ax.imshow(rgb)
+        ax.set_title(f"GT:{y_true[i]}  P:{y_pred[i]}", fontsize=8)
+        ax.axis('off')
+    plt.tight_layout()
+    plt.savefig(path, dpi=200); plt.close()
+
+def summarize_to_csv(X, y, out_csv):
+    # Per-sample averages (NDVI is channel 5)
+    ndvi_mean = X[:,5].mean(axis=(1,2))
+    # Recompute NDWI for summary (GREEN vs NIR; channels 1 & 3)
+    eps = 1e-6
+    ndwi_mean = ((X[:,1] - X[:,3]) / (X[:,1] + X[:,3] + eps)).mean(axis=(1,2))
+    df = pd.DataFrame({
+        "sample_id": np.arange(len(y)),
+        "label": y,
+        "ndvi_mean": ndvi_mean,
+        "ndwi_mean": ndwi_mean
+    })
+    df.to_csv(out_csv, index=False)
+
+# --------------------------
+# CLI & main
+# --------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=1200, help="Number of patches (>100).")
+    ap.add_argument("--size", type=int, default=32, help="Patch size (pixels).")
+    ap.add_argument("--epochs", type=int, default=10, help="Training epochs.")
+    ap.add_argument("--batch", type=int, default=64, help="Batch size.")
+    ap.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
+    ap.add_argument("--seed", type=int, default=42, help="Random seed.")
+    ap.add_argument("--out", type=str, default="outputs", help="Output directory.")
+    args = ap.parse_args()
+
+    if args.n <= 100:
+        raise ValueError("--n must be > 100")
+    set_seed(args.seed); ensure_dir(args.out)
+
+    # Build dataset
+    X, y = build_dataset(args.n, args.size, seed=args.seed)
+    ds = WetlandDataset(X, y)
+
+    # Split 80/20
+    n_train = int(0.8 * len(ds))
+    n_val = len(ds) - n_train
+    tr_ds, va_ds = random_split(ds, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed))
+    tr_ld = DataLoader(tr_ds, batch_size=args.batch, shuffle=True)
+    va_ld = DataLoader(va_ds, batch_size=args.batch, shuffle=False)
+
+    # Model & train
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SmallCNN(in_ch=6, n_classes=3).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_acc, best_state = -1.0, None
+    for ep in range(1, args.epochs + 1):
+        tr_loss = train_epoch(model, tr_ld, opt, device)
+        va_loss, va_acc, _, _ = eval_epoch(model, va_ld, device)
+        print(f"Epoch {ep:02d} | train loss {tr_loss:.4f} | val loss {va_loss:.4f} | val acc {va_acc:.3f}")
+        if va_acc > best_acc:
+            best_acc, best_state = va_acc, {k: v.cpu() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Final eval & artifacts
+    va_loss, va_acc, y_true, y_pred = eval_epoch(model, va_ld, device)
+    rep = classification_report(y_true, y_pred, target_names=["water(0)", "wetland(1)", "upland(2)"], digits=3)
+    cm = confusion_matrix(y_true, y_pred)
+
+    # Save model & metrics
+    torch.save(model.state_dict(), os.path.join(args.out, "model.pt"))
+    with open(os.path.join(args.out, "metrics.txt"), "w") as f:
+        f.write(f"Val Accuracy: {va_acc:.4f}\n\n")
+        f.write("Classification Report:\n")
+        f.write(rep + "\n")
+        f.write("Confusion Matrix:\n")
+        f.write(str(cm) + "\n")
+
+    # Preview grid
+    save_preview(X[va_ds.indices], y_true, y_pred, os.path.join(args.out, "preview.png"), n=16)
+
+    # Per-sample summary table
+    summarize_to_csv(X, y, os.path.join(args.out, "dataset_meta.csv"))
+
+    # Sample predictions log
+    with open(os.path.join(args.out, "samples_pred.txt"), "w") as f:
+        for i in range(min(50, len(y_pred))):
+            f.write(f"[{i:03d}] GT={y_true[i]}  PRED={y_pred[i]}\n")
+
+    print("Done.")
+    print("Artifacts saved in:", os.path.abspath(args.out))
+
+if __name__ == "__main__":
+    main()
